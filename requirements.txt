@@ -3,5 +3,5 @@ pdfplumber
 pandas
 reportlab
 pytesseract
-pdf2image
+pypdfium2
 pillow

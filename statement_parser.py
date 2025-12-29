@@ -3,7 +3,7 @@ import pandas as pd
 import re
 import io
 import pytesseract
-from pdf2image import convert_from_path, convert_from_bytes
+import pypdfium2 as pdfium
 from PIL import Image
 
 class BankStatementParser:
@@ -98,13 +98,20 @@ class BankStatementParser:
         """
         if hasattr(pdf_file, 'read'):
             pdf_file.seek(0)
-            file_bytes = pdf_file.read()
-            images = convert_from_bytes(file_bytes)
+            # pypdfium2 expects bytes or path
+            pdf = pdfium.PdfDocument(pdf_file)
         else:
-             images = convert_from_path(pdf_file)
+            pdf = pdfium.PdfDocument(pdf_file)
 
         all_text = ""
-        for image in images:
+        n_pages = len(pdf)
+
+        for i in range(n_pages):
+            page = pdf[i]
+            # Render to image (scale=3 for better OCR resolution)
+            bitmap = page.render(scale=3)
+            image = bitmap.to_pil()
+
             text = pytesseract.image_to_string(image)
             all_text += text + "\n"
 
