@@ -2,6 +2,9 @@ import pdfplumber
 import pandas as pd
 import re
 import io
+import pytesseract
+from pdf2image import convert_from_path, convert_from_bytes
+from PIL import Image
 
 class BankStatementParser:
     def __init__(self):
@@ -32,26 +35,42 @@ class BankStatementParser:
         """
         transactions = []
         account_number = None
+        has_text_content = False
 
-        with pdfplumber.open(pdf_file) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text()
+        # Reset pointer if it's a file object
+        if hasattr(pdf_file, 'seek'):
+            pdf_file.seek(0)
 
-                # Try to find account number if not already found
-                if not account_number and text:
-                    account_number = self.extract_account_number(text)
+        try:
+            with pdfplumber.open(pdf_file) as pdf:
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if text:
+                        has_text_content = True
 
-                # Try to extract tables
-                tables = page.extract_tables()
+                    # Try to find account number if not already found
+                    if not account_number and text:
+                        account_number = self.extract_account_number(text)
 
-                if tables:
-                    for table in tables:
-                        df = self._process_table(table)
-                        if df is not None:
-                             transactions.append(df)
-                else:
-                    # Fallback to text parsing if no tables found (simplified)
-                    pass
+                    # Try to extract tables
+                    tables = page.extract_tables()
+
+                    if tables:
+                        for table in tables:
+                            df = self._process_table(table)
+                            if df is not None:
+                                 transactions.append(df)
+        except Exception as e:
+            print(f"Error reading PDF with pdfplumber: {e}")
+
+        # Fallback to OCR if no tables found or no text content
+        if not transactions:
+            print("No text/tables found. Attempting OCR...")
+            ocr_df = self._parse_with_ocr(pdf_file)
+            if ocr_df is not None and not ocr_df.empty:
+                 # Check if we can find account number in OCR text
+                 # _parse_with_ocr might return it if implemented, or we scan raw text
+                 transactions.append(ocr_df)
 
         if transactions:
             final_df = pd.concat(transactions, ignore_index=True)
@@ -72,6 +91,102 @@ class BankStatementParser:
             return final_df[cols]
         else:
             return pd.DataFrame(columns=['Account', 'Date', 'Amount'])
+
+    def _parse_with_ocr(self, pdf_file) -> pd.DataFrame:
+        """
+        Converts PDF to images, extracts text via OCR, and parses line by line.
+        """
+        if hasattr(pdf_file, 'read'):
+            pdf_file.seek(0)
+            file_bytes = pdf_file.read()
+            images = convert_from_bytes(file_bytes)
+        else:
+             images = convert_from_path(pdf_file)
+
+        all_text = ""
+        for image in images:
+            text = pytesseract.image_to_string(image)
+            all_text += text + "\n"
+
+        return self._parse_ocr_text(all_text)
+
+    def _parse_ocr_text(self, text) -> pd.DataFrame:
+        """
+        Parses raw text from OCR.
+        Assumes format like:
+        DATE.....AMOUNT.TRANSACTION DESCRIPTION
+        MM/DD    123.45 DESCRIPTION
+        """
+        lines = text.split('\n')
+        data = []
+
+        # Regex to capture MM/DD Date and Amount (possibly with commas)
+        # 12/08 604.67 ACH CREDIT ...
+        # 11/28 20.00 ACH DEBIT ...
+        line_regex = re.compile(r'^(\d{1,2}/\d{1,2})\s+([0-9,]+\.\d{2})\s+(.*)', re.IGNORECASE)
+
+        current_section_sign = 0 # 1 for credit, -1 for debit, 0 unknown
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Detect Section Headers
+            if "DEPOSITS" in line.upper() or "CREDITS" in line.upper():
+                current_section_sign = 1
+            elif "DEBITS" in line.upper():
+                current_section_sign = -1
+
+            match = line_regex.match(line)
+            if match:
+                date_str = match.group(1)
+                amount_str = match.group(2)
+                desc_str = match.group(3)
+
+                # Parse amount
+                try:
+                    amount = float(amount_str.replace(',', ''))
+                except ValueError:
+                    continue
+
+                # Determine sign
+                sign = current_section_sign
+
+                # Keyword override
+                if "DEBIT" in desc_str.upper() and "CREDIT" not in desc_str.upper():
+                    sign = -1
+                elif "CREDIT" in desc_str.upper() and "DEBIT" not in desc_str.upper():
+                    sign = 1
+                elif "PAYMENT" in desc_str.upper():
+                     # Payments are usually debits (money leaving account)
+                     # But "Payment Received" is credit.
+                     pass
+
+                # Apply sign
+                if sign != 0:
+                     amount = abs(amount) * sign
+                else:
+                    # If we really don't know, keep as positive but this is rare in bank statements
+                    # usually grouped by section.
+                    # Defaulting to negative for unknown might be safer for "expenses" but incorrect for income.
+                    # Let's check keywords again
+                    pass
+
+                data.append({
+                    'Date': date_str,
+                    'Amount': amount,
+                    'Description': desc_str
+                })
+            else:
+                # Potential multi-line description logic
+                # If we just added a row, and this line doesn't look like a date/amount, append to prev description
+                if data and not re.match(r'\d{1,2}/\d{1,2}', line):
+                    # Check if it looks like a continuation (indented or just text)
+                    # Simple heuristic: append to last
+                    data[-1]['Description'] += " " + line
+
+        return pd.DataFrame(data)
 
     def _process_table(self, table) -> pd.DataFrame:
         """

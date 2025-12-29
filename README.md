@@ -15,6 +15,19 @@ A local web application to parse bank statement PDFs and export the transactions
 ## Prerequisites
 
 - Python 3.8 or higher
+- System dependencies for OCR (Tesseract and Poppler)
+
+### Installing System Dependencies
+
+**Ubuntu/Debian:**
+```bash
+sudo apt-get install tesseract-ocr poppler-utils
+```
+
+**macOS (Homebrew):**
+```bash
+brew install tesseract poppler
+```
 
 ## Installation
 

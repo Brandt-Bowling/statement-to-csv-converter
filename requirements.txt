@@ -2,3 +2,6 @@ streamlit
 pdfplumber
 pandas
 reportlab
+pytesseract
+pdf2image
+pillow
