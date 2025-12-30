@@ -198,6 +198,10 @@ class BankStatementParser:
 
                 desc_upper = desc_str.upper()
 
+                # Ignore Beginning/Ending Balance rows which are not transactions
+                if "BEGINNING BALANCE" in desc_upper or "ENDING BALANCE" in desc_upper:
+                    continue
+
                 # Keyword override
                 if "DEBIT" in desc_upper and "CREDIT" not in desc_upper:
                     sign = -1

@@ -62,6 +62,7 @@ DATE..........AMOUNT.TRANSACTION DESCRIPTION
         text = """
         Transactions
         Date Description Debits Credits Balance
+        11/23 Beginning Balance $4,749.85
         11/25 ACH DEP 112524 $170.00 $4,919.85
               VENMO CASHOUT
               ************0873
@@ -74,6 +75,9 @@ DATE..........AMOUNT.TRANSACTION DESCRIPTION
 
         self.assertFalse(df.empty)
         self.assertEqual(len(df), 2)
+
+        # Ensure Beginning Balance is filtered
+        self.assertFalse(df['Description'].str.contains("Beginning Balance").any())
 
         # Row 1: Credit
         row1 = df.iloc[0]
