@@ -27,7 +27,7 @@ DATE..........AMOUNT.TRANSACTION DESCRIPTION
         """
 
         parser = BankStatementParser()
-        df = parser._parse_ocr_text(ocr_text)
+        df = parser._parse_text_lines(ocr_text)
 
         # Verify result
         self.assertFalse(df.empty)
@@ -54,6 +54,38 @@ DATE..........AMOUNT.TRANSACTION DESCRIPTION
 
         # Check total count
         self.assertEqual(len(df), 7)
+
+    def test_parse_digital_text_format(self):
+        """
+        Tests the new format: Date Description Amount Balance
+        """
+        text = """
+        Transactions
+        Date Description Debits Credits Balance
+        11/25 ACH DEP 112524 $170.00 $4,919.85
+              VENMO CASHOUT
+              ************0873
+        11/25 ACH WITHDRAWAL 112524 $30.00 $4,889.85
+              VENMO PAYMENT
+              ************5766
+        """
+        parser = BankStatementParser()
+        df = parser._parse_text_lines(text)
+
+        self.assertFalse(df.empty)
+        self.assertEqual(len(df), 2)
+
+        # Row 1: Credit
+        row1 = df.iloc[0]
+        self.assertEqual(row1['Date'], '11/25')
+        self.assertEqual(row1['Amount'], 170.00)
+        self.assertIn('VENMO CASHOUT', row1['Description'])
+
+        # Row 2: Debit
+        row2 = df.iloc[1]
+        self.assertEqual(row2['Date'], '11/25')
+        self.assertEqual(row2['Amount'], -30.00)
+        self.assertIn('VENMO PAYMENT', row2['Description'])
 
 if __name__ == '__main__':
     unittest.main()

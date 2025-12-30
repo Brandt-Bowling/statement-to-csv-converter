@@ -37,6 +37,9 @@ class BankStatementParser:
         account_number = None
         has_text_content = False
 
+        # Buffer for text content from pages where table extraction failed
+        text_content_buffer = []
+
         # Reset pointer if it's a file object
         if hasattr(pdf_file, 'seek'):
             pdf_file.seek(0)
@@ -54,14 +57,29 @@ class BankStatementParser:
 
                     # Try to extract tables
                     tables = page.extract_tables()
+                    page_has_tables = False
 
                     if tables:
                         for table in tables:
                             df = self._process_table(table)
                             if df is not None:
                                  transactions.append(df)
+                                 page_has_tables = True
+
+                    # If no tables found on this page but text exists, buffer it for text-based parsing
+                    if not page_has_tables and text:
+                        text_content_buffer.append(text)
+
         except Exception as e:
             print(f"Error reading PDF with pdfplumber: {e}")
+
+        # Process buffered text content (from pages without tables)
+        if text_content_buffer:
+            print("Attempting to parse text content from pages where table extraction failed...")
+            full_text = "\n".join(text_content_buffer)
+            text_df = self._parse_text_lines(full_text)
+            if not text_df.empty:
+                transactions.append(text_df)
 
         # Fallback to OCR if no tables found or no text content
         if not transactions:
@@ -115,22 +133,26 @@ class BankStatementParser:
             text = pytesseract.image_to_string(image)
             all_text += text + "\n"
 
-        return self._parse_ocr_text(all_text)
+        return self._parse_text_lines(all_text)
 
-    def _parse_ocr_text(self, text) -> pd.DataFrame:
+    def _parse_text_lines(self, text) -> pd.DataFrame:
         """
-        Parses raw text from OCR.
-        Assumes format like:
-        DATE.....AMOUNT.TRANSACTION DESCRIPTION
-        MM/DD    123.45 DESCRIPTION
+        Parses raw text (from OCR or pdfplumber extraction).
+        Supports multiple formats:
+        1. Date Amount Description
+        2. Date Description Amount [Balance]
         """
         lines = text.split('\n')
         data = []
 
-        # Regex to capture MM/DD Date and Amount (possibly with commas)
+        # Regex 1: Date Amount Description
         # 12/08 604.67 ACH CREDIT ...
-        # 11/28 20.00 ACH DEBIT ...
-        line_regex = re.compile(r'^(\d{1,2}/\d{1,2})\s+([0-9,]+\.\d{2})\s+(.*)', re.IGNORECASE)
+        regex_date_amount_desc = re.compile(r'^(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\s+([0-9,]+\.\d{2})\s+(.*)', re.IGNORECASE)
+
+        # Regex 2: Date Description Amount [Balance]
+        # 11/25 ACH DEP... 170.00 4,919.85
+        # We look for Date, then greedy match text, then Amount, then optional Balance at end
+        regex_date_desc_amount = re.compile(r'^(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\s+(.+?)\s+(-?\$?[0-9,]+\.\d{2})(?:\s+(-?\$?[0-9,]+\.\d{2}))?$', re.IGNORECASE)
 
         current_section_sign = 0 # 1 for credit, -1 for debit, 0 unknown
 
@@ -142,43 +164,56 @@ class BankStatementParser:
             # Detect Section Headers
             if "DEPOSITS" in line.upper() or "CREDITS" in line.upper():
                 current_section_sign = 1
-            elif "DEBITS" in line.upper():
+            elif "DEBITS" in line.upper() or "WITHDRAWALS" in line.upper():
                 current_section_sign = -1
 
-            match = line_regex.match(line)
-            if match:
-                date_str = match.group(1)
-                amount_str = match.group(2)
-                desc_str = match.group(3)
+            # Try Regex 1 (Date Amount Desc)
+            match1 = regex_date_amount_desc.match(line)
+            match2 = regex_date_desc_amount.match(line)
 
+            date_str = None
+            amount_str = None
+            desc_str = None
+
+            if match1:
+                date_str = match1.group(1)
+                amount_str = match1.group(2)
+                desc_str = match1.group(3)
+            elif match2:
+                date_str = match2.group(1)
+                desc_str = match2.group(2)
+                amount_str = match2.group(3)
+                # match2.group(4) is balance, ignored
+
+            if date_str and amount_str:
                 # Parse amount
                 try:
-                    amount = float(amount_str.replace(',', ''))
+                    clean_amt = amount_str.replace(',', '').replace('$', '')
+                    amount = float(clean_amt)
                 except ValueError:
                     continue
 
                 # Determine sign
                 sign = current_section_sign
 
+                desc_upper = desc_str.upper()
+
                 # Keyword override
-                if "DEBIT" in desc_str.upper() and "CREDIT" not in desc_str.upper():
+                if "DEBIT" in desc_upper and "CREDIT" not in desc_upper:
                     sign = -1
-                elif "CREDIT" in desc_str.upper() and "DEBIT" not in desc_str.upper():
+                elif "CREDIT" in desc_upper and "DEBIT" not in desc_upper:
                     sign = 1
-                elif "PAYMENT" in desc_str.upper():
-                     # Payments are usually debits (money leaving account)
-                     # But "Payment Received" is credit.
-                     pass
+                elif "WITHDRAWAL" in desc_upper:
+                    sign = -1
+                elif "DEP" in desc_upper or "DEPOSIT" in desc_upper:
+                    sign = 1
+                elif "PAYMENT" in desc_upper:
+                     # Usually debit
+                     sign = -1
 
                 # Apply sign
                 if sign != 0:
                      amount = abs(amount) * sign
-                else:
-                    # If we really don't know, keep as positive but this is rare in bank statements
-                    # usually grouped by section.
-                    # Defaulting to negative for unknown might be safer for "expenses" but incorrect for income.
-                    # Let's check keywords again
-                    pass
 
                 data.append({
                     'Date': date_str,
@@ -187,11 +222,12 @@ class BankStatementParser:
                 })
             else:
                 # Potential multi-line description logic
-                # If we just added a row, and this line doesn't look like a date/amount, append to prev description
+                # If we just added a row, and this line doesn't look like a date, append to prev description
+                # Avoid appending if it looks like a header or garbage
                 if data and not re.match(r'\d{1,2}/\d{1,2}', line):
                     # Check if it looks like a continuation (indented or just text)
-                    # Simple heuristic: append to last
-                    data[-1]['Description'] += " " + line
+                    if "Summary" not in line and "Balance" not in line and "Transactions" not in line:
+                         data[-1]['Description'] += " " + line
 
         return pd.DataFrame(data)
 
