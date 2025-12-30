@@ -135,26 +135,34 @@ class BankStatementParser:
 
         return self._parse_text_lines(all_text)
 
+    def _clean_money(self, val):
+        if not val:
+            return 0.0
+        val = str(val).replace(',', '').replace('$', '')
+        if val.startswith('(') and val.endswith(')'):
+            val = '-' + val[1:-1]
+        try:
+            return float(val)
+        except ValueError:
+            return 0.0
+
     def _parse_text_lines(self, text) -> pd.DataFrame:
         """
         Parses raw text (from OCR or pdfplumber extraction).
-        Supports multiple formats:
-        1. Date Amount Description
-        2. Date Description Amount [Balance]
+        Uses a robust Right-to-Left strategy to identify amounts and balances.
         """
         lines = text.split('\n')
         data = []
 
-        # Regex 1: Date Amount Description
-        # 12/08 604.67 ACH CREDIT ...
-        regex_date_amount_desc = re.compile(r'^(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\s+([0-9,]+\.\d{2})\s+(.*)', re.IGNORECASE)
+        # Regex to find money-like patterns
+        # Matches: $1,234.56, -123.45, (123.45), 123.45
+        money_pattern = re.compile(r'(?:-?\$?[0-9,]+\.\d{2}|\(\$?[0-9,]+\.\d{2}\))')
 
-        # Regex 2: Date Description Amount [Balance]
-        # 11/25 ACH DEP... 170.00 4,919.85
-        # We look for Date, then greedy match text, then Amount, then optional Balance at end
-        regex_date_desc_amount = re.compile(r'^(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\s+(.+?)\s+(-?\$?[0-9,]+\.\d{2})(?:\s+(-?\$?[0-9,]+\.\d{2}))?$', re.IGNORECASE)
+        # Regex for Date at start
+        date_pattern = re.compile(r'^(\d{1,2}/\d{1,2}(?:/\d{2,4})?)')
 
-        current_section_sign = 0 # 1 for credit, -1 for debit, 0 unknown
+        current_section_sign = 0
+        running_balance = None
 
         for line in lines:
             line = line.strip()
@@ -167,71 +175,123 @@ class BankStatementParser:
             elif "DEBITS" in line.upper() or "WITHDRAWALS" in line.upper():
                 current_section_sign = -1
 
-            # Try Regex 1 (Date Amount Desc)
-            match1 = regex_date_amount_desc.match(line)
-            match2 = regex_date_desc_amount.match(line)
+            # Check for Beginning Balance
+            if "BEGINNING BALANCE" in line.upper():
+                tokens = money_pattern.findall(line)
+                if tokens:
+                    # Assume the last number is the balance
+                    running_balance = self._clean_money(tokens[-1])
+                continue # Skip row
 
-            date_str = None
-            amount_str = None
-            desc_str = None
+            if "ENDING BALANCE" in line.upper():
+                continue
 
-            if match1:
-                date_str = match1.group(1)
-                amount_str = match1.group(2)
-                desc_str = match1.group(3)
-            elif match2:
-                date_str = match2.group(1)
-                desc_str = match2.group(2)
-                amount_str = match2.group(3)
-                # match2.group(4) is balance, ignored
+            match_date = date_pattern.match(line)
+            if match_date:
+                date_str = match_date.group(1)
 
-            if date_str and amount_str:
-                # Parse amount
-                try:
-                    clean_amt = amount_str.replace(',', '').replace('$', '')
-                    amount = float(clean_amt)
-                except ValueError:
+                # Extract all money tokens in the line
+                money_tokens = money_pattern.findall(line)
+
+                raw_amount = 0.0
+                balance = None
+                desc_str = ""
+
+                if not money_tokens:
+                    # No money found, treat as continuation or invalid
+                    if data and not "Balance" in line:
+                         data[-1]['Description'] += " " + line
                     continue
 
-                # Determine sign
-                sign = current_section_sign
+                # Determine Format: Date Amount Desc (Format 1) vs Date Desc Amount [Bal] (Format 2)
+                # Check position of first token
+                first_token = money_tokens[0]
+                content_part = line[len(date_str):]
+                idx_first = content_part.find(first_token)
+                prefix = content_part[:idx_first].strip()
 
-                desc_upper = desc_str.upper()
+                # If prefix is empty (only spaces), it's Format 1 (Date Amount ...)
+                is_format_1 = (len(prefix) == 0)
 
-                # Ignore Beginning/Ending Balance rows which are not transactions
-                if "BEGINNING BALANCE" in desc_upper or "ENDING BALANCE" in desc_upper:
-                    continue
+                if is_format_1:
+                    # Format 1: Date Amount Desc
+                    amt_str = first_token
+                    raw_amount = abs(self._clean_money(amt_str))
+                    # Description is everything after the amount
+                    desc_str = content_part[idx_first + len(first_token):].strip()
+                    # Balance usually not present or ignored in this legacy format
+                    balance = None
+                else:
+                    # Format 2: Date Desc Amount [Balance]
+                    if len(money_tokens) >= 2:
+                        bal_str = money_tokens[-1]
+                        amt_str = money_tokens[-2]
+                        balance = self._clean_money(bal_str)
+                        raw_amount = abs(self._clean_money(amt_str))
+                        # Description: Remove last 2 tokens
+                        tokens_to_remove = money_tokens[-2:]
+                    else:
+                        amt_str = money_tokens[-1]
+                        raw_amount = abs(self._clean_money(amt_str))
+                        balance = None
+                        tokens_to_remove = money_tokens[-1:]
 
-                # Keyword override
-                if "DEBIT" in desc_upper and "CREDIT" not in desc_upper:
-                    sign = -1
-                elif "CREDIT" in desc_upper and "DEBIT" not in desc_upper:
-                    sign = 1
-                elif "WITHDRAWAL" in desc_upper:
-                    sign = -1
-                elif "DEP" in desc_upper or "DEPOSIT" in desc_upper:
-                    sign = 1
-                elif "PAYMENT" in desc_upper:
-                     # Usually debit
-                     sign = -1
+                    # Determine Description
+                    temp_line = content_part.strip()
+                    for tok in reversed(tokens_to_remove):
+                         idx = temp_line.rfind(tok)
+                         if idx != -1:
+                             temp_line = temp_line[:idx]
+                    desc_str = temp_line.strip()
 
-                # Apply sign
-                if sign != 0:
-                     amount = abs(amount) * sign
+                # Determine Sign
+                final_amount = raw_amount
+                sign_determined = False
+
+                # Method 1: Balance Math (Only applies if we found a Balance)
+                if running_balance is not None and balance is not None:
+                    delta = balance - running_balance
+                    # Tolerance for float comparison
+                    if abs(abs(delta) - raw_amount) < 0.02:
+                        final_amount = delta # Capture sign from delta
+                        sign_determined = True
+                        running_balance = balance # Update
+
+                if not sign_determined:
+                    # Method 2: Keywords/Section
+                    desc_upper = desc_str.upper()
+                    sign = current_section_sign
+
+                    if "DEBIT" in desc_upper and "CREDIT" not in desc_upper:
+                        sign = -1
+                    elif "CREDIT" in desc_upper and "DEBIT" not in desc_upper:
+                        sign = 1
+                    elif "WITHDRAWAL" in desc_upper:
+                        sign = -1
+                    elif "DEP" in desc_upper or "DEPOSIT" in desc_upper:
+                        sign = 1
+                    elif "PAYMENT" in desc_upper:
+                         sign = -1
+
+                    if sign != 0:
+                        final_amount = raw_amount * sign
+
+                    # If we have a balance but math didn't match, we still update running balance
+                    # for the next row (trusting the statement's balance column)
+                    if balance is not None:
+                        running_balance = balance
 
                 data.append({
                     'Date': date_str,
-                    'Amount': amount,
+                    'Amount': final_amount,
                     'Description': desc_str
                 })
+
             else:
-                # Potential multi-line description logic
-                # If we just added a row, and this line doesn't look like a date, append to prev description
-                # Avoid appending if it looks like a header or garbage
-                if data and not re.match(r'\d{1,2}/\d{1,2}', line):
-                    # Check if it looks like a continuation (indented or just text)
-                    if "Summary" not in line and "Balance" not in line and "Transactions" not in line:
-                         data[-1]['Description'] += " " + line
+                 # Continuation line
+                 # Avoid appending if it looks like a header or garbage
+                 if data and "Transactions" not in line and "Balance" not in line:
+                      data[-1]['Description'] += " " + line
 
         return pd.DataFrame(data)
 
