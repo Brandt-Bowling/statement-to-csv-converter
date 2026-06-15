@@ -110,9 +110,58 @@ class BankStatementParser:
         else:
             return pd.DataFrame(columns=['Account', 'Date', 'Amount'])
 
-    def _parse_with_ocr(self, pdf_file) -> pd.DataFrame:
+    def parse_loan_balance(self, pdf_file) -> pd.DataFrame:
         """
-        Converts PDF to images, extracts text via OCR, and parses line by line.
+        Extracts Statement Date and Outstanding Balance from the PDF.
+        Returns a DataFrame with columns: ['Date', 'Balance']
+        """
+        # Reset pointer if it's a file object
+        if hasattr(pdf_file, 'seek'):
+            pdf_file.seek(0)
+
+        all_text = ""
+        has_text_content = False
+        try:
+            with pdfplumber.open(pdf_file) as pdf:
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if text:
+                        all_text += text + "\n"
+                        has_text_content = True
+        except Exception as e:
+            print(f"Error reading PDF with pdfplumber: {e}")
+
+        # Fallback to OCR if no text found
+        if not has_text_content:
+            print("No text found. Attempting OCR for loan balance extraction...")
+            try:
+                all_text = self._extract_text_with_ocr(pdf_file)
+            except Exception as e:
+                print(f"Error extracting text with OCR: {e}")
+
+        # Regex for Statement Date
+        match_date = re.search(r"(?:Statement\s+Date|Date)\s*[:]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", all_text, re.IGNORECASE)
+        if not match_date:
+            match_date = re.search(r"(?:Statement\s+Date|Date)[\s:]*\n[\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", all_text, re.IGNORECASE)
+
+        date = match_date.group(1) if match_date else None
+
+        # Regex for Outstanding Balance
+        match_bal = re.search(r"outstanding\s+(?:balance|principal)[^\d]*?([0-9,]+(?:\.\d{2})?)", all_text, re.IGNORECASE)
+        if match_bal:
+            val = match_bal.group(1).replace(',', '')
+            balance = -abs(float(val))
+        else:
+            balance = None
+
+        if date or balance is not None:
+            return pd.DataFrame([{'Date': date, 'Balance': balance}])
+        else:
+            return pd.DataFrame(columns=['Date', 'Balance'])
+
+    def _extract_text_with_ocr(self, pdf_file) -> str:
+        """
+        Converts PDF to images and extracts raw text via OCR.
         """
         if hasattr(pdf_file, 'read'):
             pdf_file.seek(0)
@@ -132,7 +181,13 @@ class BankStatementParser:
 
             text = pytesseract.image_to_string(image)
             all_text += text + "\n"
+        return all_text
 
+    def _parse_with_ocr(self, pdf_file) -> pd.DataFrame:
+        """
+        Converts PDF to images, extracts text via OCR, and parses line by line.
+        """
+        all_text = self._extract_text_with_ocr(pdf_file)
         return self._parse_text_lines(all_text)
 
     def _clean_money(self, val):
