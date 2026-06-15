@@ -10,6 +10,8 @@ Upload your bank statement PDF. The application will attempt to extract transact
 **Note:** This runs locally in your browser/server session. No data is sent to external parties.
 """)
 
+extraction_mode = st.radio("Extraction Mode", ["Transactions", "Loan Balance"])
+
 uploaded_files = st.file_uploader("Choose PDF file(s)", type="pdf", accept_multiple_files=True)
 
 if uploaded_files:
@@ -28,13 +30,18 @@ if uploaded_files:
         status_container.write(f"Processing {uploaded_file.name}...")
         try:
             # Parse
-            df = parser.parse(uploaded_file)
+            if extraction_mode == "Loan Balance":
+                df = parser.parse_loan_balance(uploaded_file)
+                entity_name = "loan balances"
+            else:
+                df = parser.parse(uploaded_file)
+                entity_name = "transactions"
 
             if not df.empty:
                 all_dfs.append(df)
-                status_container.write(f":white_check_mark: {uploaded_file.name}: Extracted {len(df)} transactions.")
+                status_container.write(f":white_check_mark: {uploaded_file.name}: Extracted {len(df)} {entity_name}.")
             else:
-                status_container.write(f":warning: {uploaded_file.name}: No transactions found.")
+                status_container.write(f":warning: {uploaded_file.name}: No {entity_name} found.")
 
         except Exception as e:
             status_container.write(f":x: {uploaded_file.name}: Error - {e}")
@@ -47,8 +54,11 @@ if uploaded_files:
             final_df = pd.concat(all_dfs, ignore_index=True)
 
             # Deduplicate (Prefer 'newer' = keep='last' because we appended in order)
-            # Assuming Date, Amount, Description define uniqueness.
-            final_df = final_df.drop_duplicates(subset=['Date', 'Amount', 'Description'], keep='last')
+            if extraction_mode == "Loan Balance":
+                final_df = final_df.drop_duplicates(subset=['Date', 'Balance'], keep='last')
+            else:
+                # Assuming Date, Amount, Description define uniqueness.
+                final_df = final_df.drop_duplicates(subset=['Date', 'Amount', 'Description'], keep='last')
 
             # Sort by Date
             # Convert to datetime for sorting
@@ -63,7 +73,8 @@ if uploaded_files:
             # Drop the temporary object column
             final_df = final_df.drop(columns=['Date_Obj'])
 
-            st.success(f"Successfully merged data! Total unique transactions: {len(final_df)}")
+            entity_name = "loan balances" if extraction_mode == "Loan Balance" else "transactions"
+            st.success(f"Successfully merged data! Total unique {entity_name}: {len(final_df)}")
 
             st.subheader("Preview")
             st.dataframe(final_df)
