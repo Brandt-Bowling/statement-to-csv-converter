@@ -147,9 +147,9 @@ class BankStatementParser:
         date = match_date.group(1) if match_date else None
 
         # Regex for Outstanding Balance
-        match_bal = re.search(r"outstanding\s+(?:balance|principal)[^\d]*?([0-9,]+(?:\.\d{2})?)", all_text, re.IGNORECASE)
+        match_bal = re.search(r"outstanding\s+(?:balance|principal).*?(?P<amt>(?<=\$)\s*[0-9,]+(?:\.\d{2})?|[0-9]{1,3}(?:,[0-9]{3})+(?:\.\d{2})?|[0-9]+\.\d{2}(?!\d|\s*%))", all_text, re.IGNORECASE | re.DOTALL)
         if match_bal:
-            val = match_bal.group(1).replace(',', '')
+            val = match_bal.group('amt').replace(',', '').replace('$', '').strip()
             balance = -abs(float(val))
         else:
             balance = None
